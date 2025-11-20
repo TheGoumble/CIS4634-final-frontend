@@ -1,15 +1,21 @@
-# React + Vite
+# Our Project Scope
+Secure Streaming Platform – CIS 4634 Final Project. This project demonstrates a end-to-end encrypted streaming prototype built with a React + Vite frontend and a C++ WebSocket backend. The goal is to show how encrypted communication can occur between a streamer (host) and multiple viewers using AES-256-GCM, without exposing plaintext to the server. The app includes a login prompt where the user selects whether they are the streamer or a viewer. The streamer has access to key generation, key rotation, and session control, and the viewer has limited privileges where they can only join a session and decrypt what the streamer sends. All encryption and decryption occur client-side using the Web Crypto API.
 
-# 1. Create and enter the Vite React project
-npm create vite@latest secure-frontend --template react
-cd secure-frontend
-npm install
+# Frontend Features
+The frontend includes a session control panel where the user enters a session ID and WebSocket URL. Once connected, the app displays WebSocket status, RTT values, and automatically retries if disconnected. AES key management is fully implemented: the streamer can generate a new AES-256 key and share it with viewers, and viewers can paste the Base64 key and load it into the application. AES-GCM is used for all encrypted communication, with a new 12-byte IV per frame, AAD binding to “kind:counter,” and support for rotation. The app includes encrypted chat, which is the first working demonstration of the encrypted pipeline. Messages are encrypted before being sent over WebSocket and decrypted only by clients with the correct AES key. There is also an encrypted media preview card, which serves as a placeholder for encrypted H.264/AAC frames once the C++ backend sends them. All events, including connections, decryption results, errors, and chat messages, are logged in a live event log for easy debugging.
 
-# 2. Install UI dependencies (required for the secure streaming interface)
-npm install framer-motion lucide-react uuid
+# Running the Frontend
+To run the frontend, clone the repository, install dependencies with npm install, and start the development server with npm run dev. Visit http://localhost:5173
+. To use the app as the streamer: log in as “Streamer,” enter a session ID, enter the WebSocket URL (default ws://localhost:8080/stream), click Connect, generate the AES key, share the Base64 key with your viewers, and then send encrypted chat or eventually encrypted media. To use the app as a viewer: log in as “Viewer,” enter the same session ID the streamer used, paste the AES key you received, click Load, and then click Connect. Once connected, you will receive encrypted chat and, once the backend is complete, encrypted video/audio frames.
 
-# 3. Install TailwindCSS (stable v3), PostCSS, Autoprefixer
-npm install -D tailwindcss@3 postcss autoprefixer
+# C++ backend to frontend communication
+The C++ backend will need to accept the following message types to fully integrate with the frontend: a hello message containing the user’s role, session ID, and client ID; encrypted chat frames containing ivB64, aadB64, payloadB64, and counter; a metric message for RTT measurement; and rotate messages for key rotation. Encrypted frames sent from the backend to the frontend must follow the JSON format containing kind, ivB64, aadB64, payloadB64, and counter so the frontend can decrypt them using AES-GCM.
 
-# 4. Generate Tailwind + PostCSS config files
-npx tailwindcss init -p
+# Project Structure
+The project structure includes: App.jsx for login and role-based routing, and a /components folder containing TopBar.jsx, SessionControl.jsx, AesKeyManager.jsx, EncryptedChat.jsx, EncryptedPreview.jsx, EventLog.jsx, StreamerApp.jsx, and ViewerApp.jsx. TailwindCSS, framer-motion, uuid, and lucide-react are used for styling, animation, and interface icons.
+
+# AES-256-GCM (Based off of minimum requirement of 256 for our project)
+Cryptographically, the project uses AES-256-GCM for confidentiality and integrity. IVs are generated randomly for each frame, AAD binds the counter and message type, key rotation is supported, and all cryptographic operations occur on the client. This demonstrates a realistic E2EE model where the server never has access to plaintext.
+
+# Future improvements we would like to do given more time/resources
+Future improvements include adding X25519 key exchange, account creation using a database like MongoDB, invitation-based access, a viewer list, and eventually full encrypted video/audio streaming using H.264/AAC or WebRTC Insertable Streams. This frontend is designed so the backend can be plugged in cleanly once complete. A one-page summary or PDF-ready overview can be generated if needed.
