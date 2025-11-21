@@ -79,7 +79,7 @@ You will need:
 
 ## **1️⃣ Start the Java Key Server**
 
-Open a new terminal:
+Open a terminal and run:
 
 ```powershell
 cd secure-frontend/backend/java-service
@@ -93,7 +93,7 @@ You should see:
 SessionKeyServer running on port 8081
 ```
 
-Leave it running.
+Leave this window running.
 
 ---
 
@@ -107,11 +107,32 @@ npm install
 npm run dev
 ```
 
-Navigate to:
+Then open:
 
 ```
 http://localhost:5173/
 ```
+
+Leave this running.
+
+---
+
+## **3️⃣ Start the WebSocket Relay (Temporary Node.js Server)**
+
+Open a **third** terminal:
+
+```powershell
+cd secure-frontend
+node ws-server.cjs
+```
+
+You should see:
+
+```
+WebSocket relay running on ws://localhost:8080/stream
+```
+
+This is required for encrypted chat to work.
 
 ---
 
