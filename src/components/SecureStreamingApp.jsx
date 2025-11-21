@@ -12,6 +12,7 @@ import {
   Send,
   Plug,
   PlugZap,
+  SignalHigh,
   Radio,
   Wifi,
   RotateCw,
@@ -20,15 +21,13 @@ import {
 const WS_RETRY_MS = 1200;
 const MAX_LOG = 400;
 
-/* ---------- Crypto helpers ---------- */
-
+// ---- Base64 helpers ----
 function b64ToBytes(b64) {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
 }
-
 function bytesToB64(buf) {
   const bytes = new Uint8Array(buf);
   let s = "";
@@ -36,18 +35,17 @@ function bytesToB64(buf) {
   return btoa(s);
 }
 
+// ---- WebCrypto AES-GCM helpers ----
 async function importRawAesKey(rawKey) {
   return crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, [
     "encrypt",
     "decrypt",
   ]);
 }
-
 async function exportRawAesKey(key) {
   const raw = await crypto.subtle.exportKey("raw", key);
   return new Uint8Array(raw);
 }
-
 async function genAesKey(bits = 256) {
   return crypto.subtle.generateKey(
     { name: "AES-GCM", length: bits },
@@ -55,7 +53,6 @@ async function genAesKey(bits = 256) {
     ["encrypt", "decrypt"]
   );
 }
-
 async function aesGcmEncrypt(key, plaintext, iv, aad) {
   const ct = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv, additionalData: aad },
@@ -64,7 +61,6 @@ async function aesGcmEncrypt(key, plaintext, iv, aad) {
   );
   return new Uint8Array(ct);
 }
-
 async function aesGcmDecrypt(key, ciphertext, iv, aad) {
   const pt = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv, additionalData: aad },
@@ -74,8 +70,7 @@ async function aesGcmDecrypt(key, ciphertext, iv, aad) {
   return new Uint8Array(pt);
 }
 
-/* ---------- Latency hook ---------- */
-
+// ---- Latency meter hook ----
 function useLatencyMeter(wsRef) {
   const [rtt, setRtt] = useState(null);
   const lastPingTs = useRef(null);
@@ -97,10 +92,8 @@ function useLatencyMeter(wsRef) {
   return { rtt, onPong };
 }
 
-/* ---------- Main secure streaming UI (role-aware) ---------- */
-
-export function SecureStreamingApp({ user, onLogout }) {
-  const [role, setRole] = useState(user?.role === "streamer" ? "host" : "viewer");
+export default function SecureStreamingApp({ username, token, onLogout }) {
+  const [role, setRole] = useState("viewer");
   const [sessionId, setSessionId] = useState("");
   const [clientId] = useState(() => uuidv4());
   const [connected, setConnected] = useState(false);
@@ -116,9 +109,15 @@ export function SecureStreamingApp({ user, onLogout }) {
   const wsRef = useRef(null);
   const { rtt, onPong } = useLatencyMeter(wsRef);
 
-  const pushLog = (s) =>
-    setLog((L) => (L.length > MAX_LOG ? [...L.slice(-MAX_LOG / 2), s] : [...L, s]));
+  // Java key service
+  const backendBaseUrl = "http://localhost:8081";
 
+  const pushLog = (msg) =>
+    setLog((prev) =>
+      prev.length > MAX_LOG ? [...prev.slice(-MAX_LOG / 2), msg] : [...prev, msg]
+    );
+
+  // ---- WebSocket connect logic ----
   const connectWs = () => {
     if (!sessionId) {
       pushLog("⚠️ Enter a Session ID first.");
@@ -133,15 +132,7 @@ export function SecureStreamingApp({ user, onLogout }) {
     ws.onopen = () => {
       setConnected(true);
       pushLog(`🔌 Connected to ${url}`);
-      ws.send(
-        JSON.stringify({
-          type: "hello",
-          role: role === "host" ? "host" : "viewer",
-          sessionId,
-          clientId,
-          userName: user?.name || "",
-        })
-      );
+      ws.send(JSON.stringify({ type: "hello", role, sessionId, clientId }));
     };
 
     ws.onclose = () => {
@@ -150,7 +141,9 @@ export function SecureStreamingApp({ user, onLogout }) {
       setTimeout(() => connectWs(), WS_RETRY_MS);
     };
 
-    ws.onerror = (e) => pushLog(`WS error: ${JSON.stringify(e)}`);
+    ws.onerror = (e) => {
+      pushLog(`WS error: ${JSON.stringify(e)}`);
+    };
 
     ws.onmessage = async (ev) => {
       try {
@@ -167,6 +160,7 @@ export function SecureStreamingApp({ user, onLogout }) {
           pushLog("🔐 Received frame but no AES key loaded.");
           return;
         }
+
         const iv = b64ToBytes(f.ivB64);
         const aad = b64ToBytes(f.aadB64);
         const ct = b64ToBytes(f.payloadB64);
@@ -187,6 +181,7 @@ export function SecureStreamingApp({ user, onLogout }) {
     wsRef.current = ws;
   };
 
+  // ---- AES key helpers (local) ----
   const handleGenKey = async () => {
     setBusy(true);
     try {
@@ -194,7 +189,7 @@ export function SecureStreamingApp({ user, onLogout }) {
       setAesKey(key);
       const raw = await exportRawAesKey(key);
       setAesKeyB64(bytesToB64(raw));
-      pushLog("🔑 Generated AES-256-GCM key.");
+      pushLog("🔑 Locally generated AES-256-GCM key.");
     } finally {
       setBusy(false);
     }
@@ -217,6 +212,63 @@ export function SecureStreamingApp({ user, onLogout }) {
     pushLog("♻️ Requested key rotation.");
   };
 
+  // ---- Host: create session key via Java backend ----
+  const createSessionKeyFromBackend = async () => {
+    if (!sessionId) {
+      pushLog("⚠️ Enter a Session ID before creating a key.");
+      return;
+    }
+
+    try {
+      const res = await fetch(`${backendBaseUrl}/api/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const data = await res.json();
+
+      if (data.aesKeyB64) {
+        setAesKeyB64(data.aesKeyB64);
+        await handleLoadKey();
+        pushLog("🔑 AES key loaded from Java backend (host).");
+      } else {
+        pushLog("❌ Backend did not return aesKeyB64 for /api/session.");
+      }
+    } catch (err) {
+      pushLog("Error calling /api/session: " + err.message);
+    }
+  };
+
+  // ---- Viewer: join session via Java backend ----
+  const joinSessionKeyFromBackend = async () => {
+    if (!sessionId) {
+      pushLog("⚠️ Enter a Session ID before joining.");
+      return;
+    }
+
+    try {
+      const res = await fetch(`${backendBaseUrl}/api/join`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const data = await res.json();
+
+      if (data.aesKeyB64) {
+        setAesKeyB64(data.aesKeyB64);
+        await handleLoadKey();
+        pushLog("🔓 AES key loaded from Java backend (viewer).");
+      } else {
+        pushLog("❌ Backend did not return aesKeyB64 for /api/join.");
+      }
+    } catch (err) {
+      pushLog("Error calling /api/join: " + err.message);
+    }
+  };
+
+  // ---- Secure chat send ----
   const sendSecureChat = async () => {
     if (!aesKey) return pushLog("Load or generate an AES key first.");
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)
@@ -224,6 +276,7 @@ export function SecureStreamingApp({ user, onLogout }) {
 
     const counter = frameCounter + 1;
     setFrameCounter(counter);
+
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const aad = new TextEncoder().encode(`chat:${counter}`);
     const pt = new TextEncoder().encode(chatInput);
@@ -236,6 +289,7 @@ export function SecureStreamingApp({ user, onLogout }) {
       payloadB64: bytesToB64(ct),
       counter,
     };
+
     wsRef.current.send(JSON.stringify(frame));
     setChatInput("");
     pushLog(`➡️ sent secure chat (${pt.byteLength} bytes)`);
@@ -247,9 +301,9 @@ export function SecureStreamingApp({ user, onLogout }) {
       className={`inline-flex items-center justify-center gap-2 rounded-full px-4 py-2 text-sm font-medium
         ${
           connected
-            ? "bg-[#112218] text-emerald-300 border border-emerald-400/60"
-            : "bg-[#E50914] text-white border border-[#ff4b5a]/80 hover:bg-[#ff1a25]"
-        } transition`}
+            ? "bg-emerald-500/10 text-emerald-300 border border-emerald-400/50"
+            : "bg-indigo-500 text-white border border-indigo-400 hover:bg-indigo-400"
+        }`}
       disabled={connected}
     >
       {connected ? <Plug className="w-4 h-4" /> : <PlugZap className="w-4 h-4" />}
@@ -257,60 +311,54 @@ export function SecureStreamingApp({ user, onLogout }) {
     </button>
   );
 
-  const isHost = role === "host";
-
   return (
-    <div className="min-h-screen bg-[#0B0B0B] text-slate-100">
+    <div className="min-h-screen bg-[#050816] text-slate-100">
       {/* Top bar */}
-      <header className="border-b border-[#262626] bg-[#0C0C0C]/90 backdrop-blur sticky top-0 z-20">
+      <header className="border-b border-[#1f2937] bg-[#050816]/90 backdrop-blur sticky top-0 z-20">
         <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="h-9 w-9 rounded-xl bg-[#E50914] flex items-center justify-center shadow-[0_0_22px_rgba(229,9,20,0.7)]">
+            <div className="h-9 w-9 rounded-2xl bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/40">
               <Radio className="w-5 h-5 text-white" />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-semibold tracking-tight">
-                  Secure Streaming Platform
+                  CIS 4634 – Secure Streaming Platform
                 </h1>
-                <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#181818] border border-[#333] text-slate-300">
-                  AES-256-GCM · WebSocket
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#111827] border border-[#1f2937] text-slate-200">
+                  AES-GCM • Hybrid key service
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                OBS-style control panel for an end-to-end encrypted streaming session.
+                React frontend + Java key server + C++ WebSocket relay for end-to-end encrypted
+                streaming.
               </p>
             </div>
           </div>
           <div className="flex items-center gap-3 text-xs">
-            <div className="hidden sm:flex flex-col items-end text-slate-400">
-              <span className="text-[11px]">
-                Logged in as{" "}
-                <span className="font-semibold text-slate-100">{user?.name}</span>{" "}
-                ({user?.role === "streamer" ? "Streamer/Admin" : "Viewer"})
-              </span>
-              <button
-                onClick={onLogout}
-                className="mt-1 inline-flex items-center justify-center rounded-full border border-[#333] px-2 py-0.5 text-[11px] text-slate-300 hover:bg-[#1b1b1b] transition"
-              >
-                Log out
-              </button>
-            </div>
-            <div className="flex items-center gap-1 px-2 py-1 rounded-full bg-[#101010] border border-[#262626] text-[11px] text-slate-300">
-              <Wifi className="w-3 h-3" />
-              <span>RTT</span>
-              <span className={rtt != null ? "text-emerald-300" : "text-slate-500"}>
-                {rtt != null ? `${rtt} ms` : "–"}
-              </span>
-            </div>
-            <div
-              className={`px-2 py-1 rounded-full text-[11px] border ${
-                connected
-                  ? "border-emerald-500/60 bg-[#102018] text-emerald-300"
-                  : "border-[#E50914]/70 bg-[#240407] text-[#ff7b86]"
-              }`}
-            >
-              {connected ? "Live WebSocket" : "Disconnected"}
+            <div className="flex flex-col items-end gap-1">
+              <div className="flex items-center gap-2 text-slate-400">
+                <Wifi className="w-3 h-3" />
+                <span>RTT:</span>
+                <span className={rtt != null ? "text-emerald-300" : "text-slate-500"}>
+                  {rtt != null ? `${rtt} ms` : "–"}
+                </span>
+              </div>
+              {username && (
+                <div className="flex items-center gap-2 text-slate-300">
+                  <span className="text-[11px] bg-[#111827] px-2 py-0.5 rounded-full border border-[#1f2937]">
+                    Logged in as <span className="font-semibold">{username}</span>
+                  </span>
+                  {onLogout && (
+                    <button
+                      onClick={onLogout}
+                      className="text-[11px] px-2 py-0.5 rounded-full border border-[#1f2937] hover:bg-[#111827]"
+                    >
+                      Logout
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -326,13 +374,13 @@ export function SecureStreamingApp({ user, onLogout }) {
             className="space-y-4"
           >
             {/* Session card */}
-            <div className="rounded-2xl border border-[#262626] bg-[#111111] shadow-lg shadow-black/70 p-5">
+            <div className="rounded-3xl border border-[#1f2937] bg-[#0b1120]/90 backdrop-blur-xl shadow-xl shadow-black/70 p-5">
               <div className="flex items-center justify-between">
                 <h2 className="text-base font-semibold flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-[#E50914]" />
+                  <ShieldCheck className="w-4 h-4 text-indigo-400" />
                   Session Control
                 </h2>
-                <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#181818] text-slate-300 border border-[#333]">
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#020617] text-slate-200 border border-[#1f2937]">
                   Client ID: {clientId.slice(0, 8)}…
                 </span>
               </div>
@@ -343,27 +391,21 @@ export function SecureStreamingApp({ user, onLogout }) {
                     <label className="block text-[11px] uppercase tracking-wide text-slate-400 mb-1">
                       Role
                     </label>
-                    {user?.role === "streamer" ? (
-                      <select
-                        value={role}
-                        onChange={(e) => setRole(e.target.value)}
-                        className="w-full rounded-xl bg-[#101010] border border-[#303030] px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#E50914]/40"
-                      >
-                        <option value="host">Host (Streamer)</option>
-                        <option value="viewer">Viewer</option>
-                      </select>
-                    ) : (
-                      <div className="w-full rounded-xl bg-[#101010] border border-[#303030] px-3 py-2 text-sm text-slate-300 flex items-center">
-                        Viewer (read-only)
-                      </div>
-                    )}
+                    <select
+                      value={role}
+                      onChange={(e) => setRole(e.target.value)}
+                      className="w-full rounded-2xl bg-[#020617] border border-[#1f2937] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/70"
+                    >
+                      <option value="host">Host (Streamer)</option>
+                      <option value="viewer">Viewer</option>
+                    </select>
                   </div>
                   <div className="flex-[2]">
                     <label className="block text-[11px] uppercase tracking-wide text-slate-400 mb-1">
                       Session ID
                     </label>
                     <input
-                      className="w-full rounded-xl bg-[#101010] border border-[#303030] px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#E50914]/40"
+                      className="w-full rounded-2xl bg-[#020617] border border-[#1f2937] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/70"
                       placeholder="e.g. cis4634-final-demo"
                       value={sessionId}
                       onChange={(e) => setSessionId(e.target.value)}
@@ -376,14 +418,13 @@ export function SecureStreamingApp({ user, onLogout }) {
                     WebSocket URL
                   </label>
                   <input
-                    className="w-full rounded-xl bg-[#101010] border border-[#303030] px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#E50914]/40 font-mono"
+                    className="w-full rounded-2xl bg-[#020617] border border-[#1f2937] px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/70 font-mono"
                     value={wsUrl}
                     onChange={(e) => setWsUrl(e.target.value)}
-                    disabled={!isHost}
                   />
                   <p className="mt-1 text-[11px] text-slate-500">
-                    Point this at your C++ backend, e.g.{" "}
-                    <span className="font-mono text-slate-300">ws://localhost:8080/stream</span>
+                    Point this to your C++ backend, e.g.{" "}
+                    <span className="font-mono text-slate-200">ws://localhost:8080/stream</span>
                   </p>
                 </div>
 
@@ -396,55 +437,79 @@ export function SecureStreamingApp({ user, onLogout }) {
               </div>
             </div>
 
-            {/* Crypto card */}
-            <div className="rounded-2xl border border-[#262626] bg-[#111111] shadow-lg shadow-black/70 p-5">
+            {/* AES Key Management */}
+            <div className="rounded-3xl border border-[#1f2937] bg-[#0b1120]/90 backdrop-blur-xl shadow-xl shadow-black/70 p-5">
               <h3 className="text-sm font-semibold flex items-center gap-2">
-                <KeyRound className="w-4 h-4 text-[#E50914]" />
+                <KeyRound className="w-4 h-4 text-emerald-400" />
                 AES Key Management
               </h3>
               <p className="mt-1 text-xs text-slate-400">
-                Per-session AES-256-GCM key. The host derives or loads the key, then shares it
-                securely with viewers using your key exchange scheme.
+                Per-session AES-256-GCM key. Host and viewers fetch the same key from the Java key
+                service, then all encryption happens locally in the browser.
               </p>
 
               <div className="mt-4 space-y-3 text-sm">
-                {isHost && (
-                  <div className="flex flex-col sm:flex-row gap-2">
-                    <button
-                      className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2.5 bg-[#E50914] text-sm font-medium text-white hover:bg-[#ff1a25] transition shadow-md shadow-[#E50914]/40 disabled:opacity-60"
-                      onClick={handleGenKey}
-                      disabled={busy}
-                    >
-                      <Lock className="w-4 h-4" />
-                      <span>Generate AES-256</span>
-                    </button>
-                    <button
-                      className="sm:w-32 inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2.5 bg-[#1F1F1F] text-sm font-medium text-slate-100 hover:bg-[#292929] border border-[#333] transition"
-                      onClick={handleRotate}
-                    >
-                      <RotateCw className="w-4 h-4" />
-                      <span>Rotate Key</span>
-                    </button>
-                  </div>
-                )}
+                {/* Backend-driven key buttons */}
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <button
+                    className="flex-1 inline-flex items-center justify-center gap-2 rounded-2xl px-3 py-2.5
+                               bg-emerald-500 text-sm font-medium text-emerald-950 hover:bg-emerald-400 transition
+                               shadow-md shadow-emerald-500/40 disabled:opacity-60"
+                    onClick={createSessionKeyFromBackend}
+                    disabled={busy}
+                  >
+                    <Lock className="w-4 h-4" />
+                    <span>Host: Get Key from Backend</span>
+                  </button>
+                  <button
+                    className="flex-1 inline-flex items-center justify-center gap-2 rounded-2xl px-3 py-2.5
+                               bg-sky-500 text-sm font-medium text-sky-950 hover:bg-sky-400 transition
+                               shadow-md shadow-sky-500/40 disabled:opacity-60"
+                    onClick={joinSessionKeyFromBackend}
+                    disabled={busy}
+                  >
+                    <SignalHigh className="w-4 h-4" />
+                    <span>Viewer: Join & Load Key</span>
+                  </button>
+                </div>
 
+                {/* Local fallback + rotate */}
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <button
+                    className="flex-1 inline-flex items-center justify-center gap-2 rounded-2xl px-3 py-2.5
+                               bg-[#020617] text-sm font-medium text-slate-100 hover:bg-slate-800
+                               border border-[#1f2937] transition disabled:opacity-60"
+                    onClick={handleGenKey}
+                    disabled={busy}
+                  >
+                    <Lock className="w-4 h-4" />
+                    <span>Generate Local AES-256</span>
+                  </button>
+                  <button
+                    className="sm:w-32 inline-flex items-center justify-center gap-2 rounded-2xl px-3 py-2.5
+                              bg-[#020617] text-sm font-medium text-slate-100 hover:bg-slate-800
+                              border border-[#1f2937] transition"
+                    onClick={handleRotate}
+                  >
+                    <RotateCw className="w-4 h-4" />
+                    <span>Rotate Key</span>
+                  </button>
+                </div>
+
+                {/* Key text + Load */}
                 <div>
                   <label className="block text-[11px] uppercase tracking-wide text-slate-400 mb-1">
                     AES Key (Base64)
                   </label>
                   <div className="flex gap-2">
                     <input
-                      className="flex-1 rounded-xl bg-[#101010] border border-[#303030] px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#E50914]/40"
-                      placeholder={
-                        isHost
-                          ? "Generate or paste AES key…"
-                          : "Paste AES key shared by host…"
-                      }
+                      className="flex-1 rounded-2xl bg-[#020617] border border-[#1f2937] px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/70"
+                      placeholder="Paste or fetch AES key…"
                       value={aesKeyB64}
                       onChange={(e) => setAesKeyB64(e.target.value)}
                     />
                     <button
-                      className="inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 bg-[#1F1F1F] text-sm text-slate-100 hover:bg-[#292929] border border-[#333] transition"
+                      className="inline-flex items-center justify-center gap-2 rounded-2xl px-3 py-2 bg-[#020617] text-sm text-slate-100 hover:bg-slate-800 border border-[#1f2937] transition"
                       onClick={handleLoadKey}
                     >
                       <Copy className="w-4 h-4" />
@@ -458,8 +523,8 @@ export function SecureStreamingApp({ user, onLogout }) {
                     • Use a unique <span className="font-mono">IV</span> per frame.
                   </p>
                   <p>
-                    • Bind <span className="font-mono">kind:counter</span> into AAD to defend
-                    against replays.
+                    • Bind <span className="font-mono">kind:counter</span> into AAD for replay
+                    protection.
                   </p>
                 </div>
               </div>
@@ -473,28 +538,27 @@ export function SecureStreamingApp({ user, onLogout }) {
             className="space-y-4"
           >
             {/* Video preview */}
-            <div className="rounded-2xl border border-[#262626] bg-[#151515] shadow-lg shadow-black/80 p-5">
+            <div className="rounded-3xl border border-[#1f2937] bg-gradient-to-br from-[#020617] via-[#020617] to-[#0b1120] backdrop-blur-xl shadow-xl shadow-black/80 p-5">
               <div className="flex items-center justify-between gap-2 mb-3">
                 <h2 className="text-sm font-semibold flex items-center gap-2">
-                  <Video className="w-4 h-4 text-[#E50914]" />
+                  <Video className="w-4 h-4 text-indigo-400" />
                   Encrypted Stream Preview
                 </h2>
                 <span className="text-[11px] text-slate-400">
-                  Media will use the same AES key and IV/AAD rules as secure chat.
+                  Media path will use the same AES key as secure chat.
                 </span>
               </div>
 
-              <div className="relative mt-1 aspect-video rounded-xl border border-[#262626] bg-gradient-to-br from-[#0B0B0B] via-[#151515] to-[#101010] flex items-center justify-center overflow-hidden">
-                <div className="pointer-events-none absolute inset-0 opacity-40 bg-[radial-gradient(circle_at_top,_rgba(229,9,20,0.22),_transparent_60%)]" />
+              <div className="relative mt-1 aspect-video rounded-2xl border border-[#1f2937] bg-gradient-to-br from-[#020617] via-[#020617] to-[#020617] flex items-center justify-center overflow-hidden">
+                <div className="pointer-events-none absolute inset-0 opacity-40 bg-[radial-gradient(circle_at_top,_rgba(129,140,248,0.4),_transparent_60%),radial-gradient(circle_at_bottom,_rgba(34,197,94,0.35),_transparent_60%)]" />
                 <div className="relative z-10 text-center flex flex-col items-center gap-2 px-4">
                   <VideoOff className="w-10 h-10 text-slate-400" />
                   <p className="text-sm text-slate-200">
                     When your C++ backend is ready, push encrypted H.264/AAC fragments over
-                    WebSocket and decrypt them here in real time.
+                    WebSocket and decrypt them here.
                   </p>
                   <p className="text-xs text-slate-400">
-                    For now, this preview card represents the “video frame” side of the same hybrid
-                    encryption pipeline.
+                    For now, this card proves your front-end session and crypto flow are wired up.
                   </p>
                 </div>
               </div>
@@ -503,27 +567,30 @@ export function SecureStreamingApp({ user, onLogout }) {
             {/* Chat + notes */}
             <div className="grid md:grid-cols-2 gap-4">
               {/* Secure Chat */}
-              <div className="rounded-2xl border border-[#262626] bg-[#111111] shadow-md shadow-black/70 p-4">
+              <div className="rounded-3xl border border-[#1f2937] bg-[#0b1120]/90 backdrop-blur-xl shadow-lg shadow-black/70 p-4">
                 <h3 className="text-sm font-semibold flex items-center gap-2 mb-2">
-                  <Send className="w-4 h-4 text-[#E50914]" />
-                  Secure Chat (AES-256-GCM)
+                  <Send className="w-4 h-4 text-sky-400" />
+                  Secure Chat (AES path)
                 </h3>
 
                 <p className="text-xs text-slate-400 mb-3">
-                  Chat messages are encrypted in the browser with AES-256-GCM before being sent over
-                  WebSocket. Only clients with the session key can read them.
+                  Messages are encrypted client-side with AES-GCM before being sent over WebSocket.
+                  This is your simplest smoke test before streaming media.
                 </p>
 
                 <div className="space-y-2">
                   <input
-                    className="w-full rounded-xl bg-[#101010] border border-[#303030] px-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#E50914]/40"
+                    className="w-full rounded-2xl bg-[#020617] border border-[#1f2937] px-3 py-2.5 text-sm
+                               focus:outline-none focus:ring-2 focus:ring-sky-500/70"
                     placeholder="Type a secure message…"
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
                   />
                   <div className="flex justify-end">
                     <button
-                      className="w-28 sm:w-32 inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2.5 bg-[#E50914] text-sm font-medium text-white hover:bg-[#ff1a25] transition shadow-md shadow-[#E50914]/40"
+                      className="w-28 sm:w-32 inline-flex items-center justify-center gap-2 rounded-2xl px-3 py-2.5
+                                 bg-sky-500 text-sm font-medium text-sky-950 hover:bg-sky-400 transition
+                                 shadow-md shadow-sky-500/40"
                       onClick={sendSecureChat}
                     >
                       <Send className="w-4 h-4" />
@@ -533,121 +600,56 @@ export function SecureStreamingApp({ user, onLogout }) {
                 </div>
 
                 <p className="mt-2 text-[11px] text-slate-500">
-                  This is the same encryption path used for media frames, just with smaller payloads.
+                  Encrypted chat shares the same AES key and IV/AAD rules as your media frames.
                 </p>
               </div>
 
-              {/* Notes */}
-              <div className="rounded-2xl border border-[#262626] bg-[#111111] shadow-md shadow-black/70 p-4 text-sm">
-                <h3 className="font-semibold mb-2">
-                  {isHost ? "Architecture Notes" : "Session / Viewer Notes"}
-                </h3>
-                {isHost ? (
-                  <ul className="space-y-1.5 text-slate-300 text-xs">
-                    <li>
-                      • <span className="font-semibold">Host</span> owns session lifecycle, key
-                      rotation, and WebSocket endpoint selection.
-                    </li>
-                    <li>
-                      • AES-256-GCM keys are generated or loaded in the browser and never exposed to
-                      the backend in plaintext.
-                    </li>
-                    <li>
-                      • WebSocket carries both control messages and encrypted payloads; the server
-                      can route data without understanding it.
-                    </li>
-                    <li>
-                      • In a full deployment, add a public-key layer (e.g., X25519) so AES keys are
-                      exchanged securely over an untrusted channel.
-                    </li>
-                  </ul>
-                ) : (
-                  <ul className="space-y-1.5 text-slate-300 text-xs">
-                    <li>
-                      • Viewers join by session ID and load the AES key shared by the host via a
-                      secure side channel or key exchange.
-                    </li>
-                    <li>
-                      • All decryption happens locally; the server only forwards ciphertext.
-                    </li>
-                    <li>
-                      • Viewers cannot rotate keys or modify transport settings, which models least
-                      privilege in an E2EE streaming scenario.
-                    </li>
-                    <li>
-                      • This UI is meant to feel like an OBS monitoring panel dedicated to crypto
-                      and transport instead of scenes and sources.
-                    </li>
-                  </ul>
-                )}
+              {/* Architecture notes */}
+              <div className="rounded-3xl border border-[#1f2937] bg-[#0b1120]/90 backdrop-blur-xl shadow-lg shadow-black/70 p-4 text-sm">
+                <h3 className="font-semibold mb-2">Architecture Notes</h3>
+                <ul className="space-y-1.5 text-slate-300 text-xs">
+                  <li>
+                    • <span className="font-semibold">Java key service</span> holds per-session
+                    AES-256 keys indexed by Session ID.
+                  </li>
+                  <li>
+                    • <span className="font-semibold">Browser clients</span> import the key and run
+                    AES-GCM locally for chat and media frames.
+                  </li>
+                  <li>
+                    • <span className="font-semibold">C++ WebSocket relay</span> (or future server)
+                    just routes encrypted frames; it never sees plaintext.
+                  </li>
+                  <li>
+                    • This demonstrates a hybrid scheme: symmetric AES for data + external service
+                    for key management / distribution.
+                  </li>
+                </ul>
               </div>
             </div>
 
             {/* Event log */}
-            <div className="rounded-2xl border border-[#262626] bg-[#101010] shadow-md shadow-black/80 p-4">
+            <div className="rounded-3xl border border-[#1f2937] bg-[#020617]/95 backdrop-blur-xl shadow-lg shadow-black/80 p-4">
               <h3 className="text-sm font-semibold mb-2 flex items-center gap-2">
-                <span className="h-2 w-2 rounded-full bg-[#E50914] animate-pulse" />
+                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
                 Event Log
               </h3>
-              <div className="h-44 overflow-auto rounded-xl bg-[#050505] border border-[#1f1f1f] px-3 py-2 text-[11px] font-mono text-slate-300">
+              <div className="h-44 overflow-auto rounded-2xl bg-[#020617] border border-[#1f2937] px-3 py-2 text-[11px] font-mono text-slate-300">
                 {log.length === 0 && (
                   <div className="text-slate-500 italic">
-                    No events yet. Connect, generate/load a key, or send a secure chat message to
-                    see the pipeline in action.
+                    No events yet. Connect, fetch a key, or send a secure chat message to see the
+                    pipeline in action.
                   </div>
                 )}
-                {log.map((l, i) => (
-                  <div key={i} className="whitespace-pre-wrap leading-relaxed">
-                    {l}
+                {log.map((entry, idx) => (
+                  <div key={idx} className="whitespace-pre-wrap leading-relaxed">
+                    {entry}
                   </div>
                 ))}
               </div>
             </div>
           </motion.div>
         </div>
-
-        {/* Backend contract */}
-        <pre className="mt-8 text-[11px] text-slate-300 bg-[#101010] border border-[#262626] rounded-2xl p-4 overflow-auto font-mono">
-{`BACKEND CONTRACT (C++):
-
-1) POST /api/session
-   Req:  {role: "host"|"viewer", desiredSessionId?: string}
-   Resp: {sessionId: string, wsUrl: string}
-
-2) POST /api/key-exchange  (X25519 or server-wrapped AES)
-   Host Req:   {sessionId, action: "init", hostPubKey?: base64}
-   Viewer Req: {sessionId, action: "join", viewerPubKey?: base64}
-   Resp:       {peerPubKey?: base64, wrappedKey?: base64}
-   Note: If using KMS, return AES key wrapped with viewer public key; client unwraps → importRawAesKey
-
-3) WS /stream?id=SESSION_ID
-   Control JSON (utf-8 text frames):
-     {type:"hello", role, sessionId, clientId}
-     {type:"chat", text, clientId, ts}
-     {type:"metric", ts}  → server replies {type:"pong"}
-     {type:"rotate"}
-
-   EncryptedFrame JSON (binary or text ok, but binary preferred):
-     {
-       kind: "media"|"chat",
-       ivB64: base64(12B IV),
-       aadB64: base64(utf8('kind:counter')),
-       payloadB64: base64(AES-GCM(ct || tag)),
-       counter: N
-     }
-
-   Media framing:
-     - If you use MSE: payload = mp4/ts fragment bytes (H.264/AAC)
-     - If you use WebRTC: you can move to Insertable Streams later for true E2EE
-
-Security notes:
-  - Use TLS for all HTTP/WS
-  - Per-session AES-256-GCM key; rotate regularly
-  - Nonce IV per frame; never reuse IV under same key
-  - AAD must bind counter + stream kind
-  - Server should drop out-of-order frames beyond a small window to defeat replays
-`}
-        </pre>
       </main>
     </div>
   );
