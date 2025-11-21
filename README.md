@@ -1,21 +1,161 @@
-# Our Project Scope
-Secure Streaming Platform – CIS 4634 Final Project. This project demonstrates a end-to-end encrypted streaming prototype built with a React + Vite frontend and a C++ WebSocket backend. The goal is to show how encrypted communication can occur between a streamer (host) and multiple viewers using AES-256-GCM, without exposing plaintext to the server. The app includes a login prompt where the user selects whether they are the streamer or a viewer. The streamer has access to key generation, key rotation, and session control, and the viewer has limited privileges where they can only join a session and decrypt what the streamer sends. All encryption and decryption occur client-side using the Web Crypto API.
+# Secure Streaming Platform — CIS 4634 Final Project
 
-# Frontend Features
-The frontend includes a session control panel where the user enters a session ID and WebSocket URL. Once connected, the app displays WebSocket status, RTT values, and automatically retries if disconnected. AES key management is fully implemented: the streamer can generate a new AES-256 key and share it with viewers, and viewers can paste the Base64 key and load it into the application. AES-GCM is used for all encrypted communication, with a new 12-byte IV per frame, AAD binding to “kind:counter,” and support for rotation. The app includes encrypted chat, which is the first working demonstration of the encrypted pipeline. Messages are encrypted before being sent over WebSocket and decrypted only by clients with the correct AES key. There is also an encrypted media preview card, which serves as a placeholder for encrypted H.264/AAC frames once the C++ backend sends them. All events, including connections, decryption results, errors, and chat messages, are logged in a live event log for easy debugging.
+This project is our secure streaming prototype for CIS 4634.  
+It demonstrates a **hybrid cryptographic scheme** using:
 
-# Running the Frontend
-To run the frontend, clone the repository, install dependencies with npm install, and start the development server with npm run dev. Visit http://localhost:5173
-. To use the app as the streamer: log in as “Streamer,” enter a session ID, enter the WebSocket URL (default ws://localhost:8080/stream), click Connect, generate the AES key, share the Base64 key with your viewers, and then send encrypted chat or eventually encrypted media. To use the app as a viewer: log in as “Viewer,” enter the same session ID the streamer used, paste the AES key you received, click Load, and then click Connect. Once connected, you will receive encrypted chat and, once the backend is complete, encrypted video/audio frames.
+- **React Frontend**
+- **Java AES Key Server**
+- **AES-256-GCM encryption/decryption in the browser (WebCrypto)**
+- **(Future) C++ WebSocket relay** that only transports encrypted frames
 
-# C++ backend to frontend communication
-The C++ backend will need to accept the following message types to fully integrate with the frontend: a hello message containing the user’s role, session ID, and client ID; encrypted chat frames containing ivB64, aadB64, payloadB64, and counter; a metric message for RTT measurement; and rotate messages for key rotation. Encrypted frames sent from the backend to the frontend must follow the JSON format containing kind, ivB64, aadB64, payloadB64, and counter so the frontend can decrypt them using AES-GCM.
+The core idea:  
+**The backend manages keys.  
+The browser encrypts+decrypts.  
+The relay never sees plaintext.**
 
-# Project Structure
-The project structure includes: App.jsx for login and role-based routing, and a /components folder containing TopBar.jsx, SessionControl.jsx, AesKeyManager.jsx, EncryptedChat.jsx, EncryptedPreview.jsx, EventLog.jsx, StreamerApp.jsx, and ViewerApp.jsx. TailwindCSS, framer-motion, uuid, and lucide-react are used for styling, animation, and interface icons.
+---
 
-# AES-256-GCM (Based off of minimum requirement of 256 for our project)
-Cryptographically, the project uses AES-256-GCM for confidentiality and integrity. IVs are generated randomly for each frame, AAD binds the counter and message type, key rotation is supported, and all cryptographic operations occur on the client. This demonstrates a realistic E2EE model where the server never has access to plaintext.
+## Features
 
-# Future improvements we would like to do given more time/resources
-Future improvements include adding X25519 key exchange, account creation using a database like MongoDB, invitation-based access, a viewer list, and eventually full encrypted video/audio streaming using H.264/AAC or WebRTC Insertable Streams. This frontend is designed so the backend can be plugged in cleanly once complete. A one-page summary or PDF-ready overview can be generated if needed.
+###  Frontend (React + Vite)
+- Login screen  
+- Host or Viewer mode  
+- Create or join a Session ID  
+- Fetch AES-256-GCM key from Java backend  
+- Locally import AES key  
+- Encrypt chat messages with AES-GCM  
+- Send encrypted messages over WebSocket  
+- Clean event log to visualize the pipeline
+
+###  Java Backend (AES Key Server)
+Runs at: **http://localhost:8081**
+
+Endpoints:
+- `POST /api/session` → Host creates/receives AES key  
+- `POST /api/join` → Viewer loads the same key  
+- Keys stored in memory, returned as Base64 (`aesKeyB64`)
+
+###  Hybrid Crypto Architecture
+- AES-256-GCM for all encrypted data  
+- Java backend manages per-session keys  
+- Browser performs all crypto operations  
+- WebSocket relay only forwards ciphertext
+
+---
+
+#  Project Structure
+
+```
+secure-frontend/
+│
+├── backend/
+│   └── java-service/
+│       └── src/
+│           └── crypto/
+│               └── SessionKeyServer.java
+│
+└── src/
+    ├── App.jsx
+    └── components/
+        ├── LoginScreen.jsx
+        └── SecureStreamingApp.jsx
+```
+
+---
+
+# Requirements
+
+You will need:
+
+- **Node.js + npm**
+- **Java JDK 17+**  
+  Example install:  
+  `winget install --id Microsoft.OpenJDK.17 -e`
+- **Git**
+
+---
+
+# Running the Entire System
+
+## **1️⃣ Start the Java Key Server**
+
+Open a new terminal:
+
+```powershell
+cd secure-frontend/backend/java-service
+javac -d out src/crypto/SessionKeyServer.java
+java -cp out crypto.SessionKeyServer
+```
+
+You should see:
+
+```
+SessionKeyServer running on port 8081
+```
+
+Leave it running.
+
+---
+
+## **2️⃣ Start the React Frontend**
+
+Open a second terminal:
+
+```powershell
+cd secure-frontend
+npm install
+npm run dev
+```
+
+Navigate to:
+
+```
+http://localhost:5173/
+```
+
+---
+
+# How to Use the App
+
+## **HOST SETUP**
+1. Login  
+2. Select **Host (Streamer)**  
+3. Enter a **Session ID** (example: `cis-demo-1`)  
+4. Click **Host: Get Key from Backend**  
+5. The AES key loads + logs confirm it
+
+## **VIEWER SETUP**
+1. Open a second browser window  
+2. Login  
+3. Select **Viewer**  
+4. Use the **exact same Session ID**  
+5. Click **Viewer: Join & Load Key**  
+6. Viewer imports the same AES key
+
+Now both clients share an AES-256-GCM key.
+
+## **Secure Chat**
+- Type message  
+- Browser encrypts with AES-GCM  
+- C++ WebSocket (future) relays ciphertext  
+- Both sides decrypt locally
+
+---
+
+# Optional Backend Testing (No Browser Needed)
+
+### Create/Get Session Key
+```powershell
+Invoke-WebRequest -Uri "http://localhost:8081/api/session" `
+  -Method POST `
+  -Headers @{ "Content-Type" = "application/json" } `
+  -Body '{"sessionId":"demo"}'
+```
+
+### Viewer Join Session
+```powershell
+Invoke-WebRequest -Uri "http://localhost:8081/api/join" `
+  -Method POST `
+  -Headers @{ "Content-Type" = "application/json" } `
+  -Body '{"sessionId":"demo"}'
+```
